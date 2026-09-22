@@ -1,0 +1,701 @@
+# 实验室传感器时间线归并 + 发布后阈值告警 API（FastAPI + SQLite）
+
+多个传感器来源（source）按各自的序列号（seq）**乱序批量上报**带事件时间（`observed_at`）的读数。
+服务以“**最慢来源的事件时间 − 允许迟到量**”维护水位线（watermark），只发布越过水位线、
+且此前尚未发布的读数，并按 `(observed_at, source_id, seq)` 输出**确定顺序**的归并流。
+越过**已发布**水位线才到达的迟到读数不会改写历史，而是进入**隔离区**供查询。
+
+采集会话是**有限集合**：每个来源可单独**封存（seal）**，声明自己的 `final_observed_at`；
+各来源陆续封存期间水位线语义不变，**最后一个来源封存时**，服务在同一写事务内把全部剩余
+buffered 读数按既定全局顺序一次性发布（**尾流发布**）、推进两类告警并把会话置为 `closed`，
+此后拒绝任何新 key。
+
+在此之上，本服务还提供两种发布后告警：
+
+1. **单来源阈值告警**：为会话内某个来源创建规则后，系统在**每一条确定发布的读数**上
+   驱动该来源独立的两态状态机（`normal` → `active` → `normal`），用**进入/恢复双阈值
+   构成的滞回带**加**连续次数**消除边界抖动，并支持当前告警查询与进入/恢复事件的历史分页。
+2. **跨来源复合告警**：一条规则声明 2～4 个**不同来源**的条件（各自的方向、阈值、
+   可选 `value_key` 与 `window_seconds`）。系统按归并顺序为每个条件维护“最近一次命中”，
+   当所有条件的命中都落在各自的事件时间窗口内时产生**一次** `correlated_entered` 事件；
+   任一条件超窗即静默回到等待状态，可再次触发。
+
+此外，**释放计划**接口为 open 会话只读回答“要按全局顺序放出最早 N 条 buffered 读数，
+各来源的事件时钟最少需要推进到哪儿”：整个计算在同一个 SQLite 读快照内完成，
+已封存而时钟不足的来源不会被建议推进，而是直接给出 `attainable=false` 及原因。
+
+最后，**检查点安全的存储清理**接口 `POST /sessions/{session_id}/retention` 用于回收
+旧读数的存储空间：它只把**事件时间严格早于**给定 `cutoff` 且状态为
+`published`/`quarantined` 的读数作为候选（`buffered` 永不参与）；隔离候选可直接删除，
+而已发布候选中凡是**会话最早检查点仍可能在续读时读到**的一律保留，并在响应中返回该
+“检查点保护边界”。`dry_run=true` 只报告候选/保留/可删除数量，`dry_run=false` 在
+**同一个 `BEGIN IMMEDIATE` 写事务**内原子删除；重复请求幂等，失败整体回滚，
+且不改变水位线、告警与检查点的任何语义。
+
+- 语言/框架：Python 3.11 · FastAPI · Uvicorn
+- 存储：SQLite（WAL 模式，单文件，零外部依赖）
+- 并发：写操作在 `BEGIN IMMEDIATE` 事务内串行化，水位线推进单调、发布只发生一次，
+  告警状态、来源封存与尾流发布均在同一把写锁/同一事务内推进，消除上报与封存的并发竞态
+
+## 单条命令启动
+
+```bash
+docker compose up --build
+```
+
+启动后：
+
+- 服务地址：`http://localhost:8000`
+- 交互文档（Swagger UI）：`http://localhost:8000/docs`
+- OpenAPI JSON：`http://localhost:8000/openapi.json`
+- 健康检查：`http://localhost:8000/health`
+
+数据库文件在容器内 `/data/sensors.db`，由 compose 命名卷 `sensor-data` 持久化；
+建库与建表在应用启动时（FastAPI lifespan）自动完成，无需手动初始化。
+停止并清理：`docker compose down`（加 `-v` 同时删除数据卷）。
+
+## 必要配置
+
+通过环境变量配置（compose 中已给默认值，可按需覆盖）：
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `SENSOR_HOST` | `0.0.0.0` | uvicorn 绑定地址 |
+| `SENSOR_PORT` | `8000` | 监听端口（容器内固定 `EXPOSE 8000`，改宿主机端口改 compose 的 `ports`） |
+| `SENSOR_DB_PATH` | `/data/sensors.db` | SQLite 文件路径，父目录不存在会自动创建 |
+
+## 本地开发（不用 Docker）
+
+```bash
+python3 -m pip install -r requirements.txt
+SENSOR_DB_PATH=./sensors.db uvicorn app.main:app --reload --port 8000
+pytest -q        # 运行 195 个端到端行为测试（需 pytest、httpx）
+```
+
+## 时间线语义
+
+1. **创建会话固定来源列表与迟到容忍**：`source_ids` 之后不可更改；上报未知 `source_id` 返回 400。
+2. **首报门槛**：所有来源都至少上报一次（或被封存，封存即声明了最终事件时间）后水位线才有定义；
+   此前读数全部缓冲、不发布、不隔离。
+3. **水位线**：`WM = min(每个来源已知最大 observed_at) − allowed_lateness_seconds`，单调不减
+   （来源时钟回拨不会使已发布水位线倒退）。已封存来源以其 `final_observed_at` 作为已知最大值
+   参与同一个水位线计算，因此各来源陆续封存时水位线保持原有语义。
+4. **发布规则**：仅当 `observed_at < WM`（严格小于，落在边界上的读数继续等待）时发布；
+   每次上报只发布此前未发布的缓冲读数。发布顺序固定为 `observed_at, source_id, seq`。
+5. **幂等**：重复提交 `(source_id, seq)` 且 `value` 相同 → 计为 `duplicates` 的空操作；
+   同 key 不同 payload → 409，且该批次整体回滚（不会半写）。来源封存、甚至会话关闭后，
+   完全相同的既有读数重试**仍然**计为 `duplicates`。
+6. **隔离（quarantine）**：读数到达时若 `observed_at < 已发布水位线`，它永远无法再进入已发布流，
+   原样写入隔离区（记录当时的水位线），已发布历史不发生任何变化。
+7. 时间统一按 UTC 处理：接受 `...Z`、带偏移量（`+02:00`）或不带时区（按 UTC）的 ISO 8601 字符串。
+8. **来源封存（seal）**：封存接口为某来源声明 `final_observed_at`；该值**不得早于**该来源已见的
+   最大事件时间（否则 400）。同值重试幂等（返回相同的封存结果、不改变 `sealed_at`）；
+   已封存后用不同值封存 → 409。未知来源 → 400，会话不存在 → 404。
+9. **封存后拒绝新读数**：来源封存后，任何此前未见过的 `(source_id, seq)` 上报均返回 409；
+   但对**完全相同的既有读数**的重试照旧计为 `duplicates`，同 key 不同 payload 照旧 409。
+   批次中只要混入一条被封存来源的新 key，整批回滚。
+10. **尾流发布与关闭（close）**：当（且仅当）**最后一个**来源封存时，系统在封存所在的同一个
+    `BEGIN IMMEDIATE` 写事务内：把所有剩余 buffered 读数按既定全局顺序 `(observed_at,
+    source_id, seq)` 全部发布（以一个晚于任何缓冲事件时间的**终止水位线**一次性发布；
+    此前正常推进的水位线保持单调），随后推进全部单来源告警与跨来源复合告警，最后把会话置为
+    `closed`。关闭后任何新 key 上报一律 409（既有读数的相同重试仍计为 duplicates）。
+11. **同一把写锁**：封存与上报都在同一串行化写事务内执行，因此“封存与新读数并发”只会得到
+    两种线性化结果之一——读数先落库（封存照常进行），或封存先生效（新读数 409），
+    不会出现封存后仍混入新读数、或尾流发布遗漏/重复读数的竞态。
+
+## 告警状态机语义
+
+每条规则绑定一个会话中的一个来源，方向为 `above`（高于阈值告警）或 `below`（低于阈值告警），
+状态机**只消费该来源状态为“已发布”的读数**，按发布顺序 `(observed_at, seq)` 逐条推进：
+
+- **normal（正常）**：连续出现 `enter_consecutive` 条“越限”读数后进入 `active` 并产生
+  `entered` 事件。`above` 下越限指 `value > enter_threshold`；`below` 下指 `value < enter_threshold`。
+- **active（告警中）**：连续出现 `recover_consecutive` 条“恢复”读数后回到 `normal` 并产生
+  `recovered` 事件。`above` 下恢复指 `value < recover_threshold`；`below` 下指 `value > recover_threshold`。
+- **滞回防抖**：`above` 要求 `recover_threshold < enter_threshold`，`below` 要求
+  `recover_threshold > enter_threshold`；落在两个阈值之间（滞回带内）的读数不越限也不恢复，
+  只会把当前连续计数清零。阈值比较是**严格**的，恰好等于阈值的读数不计入。
+- 非数值（字符串、布尔、NaN/Infinity）、缺失值或指定了 `value_key` 但对象里没有该键时，
+  该读数只会重置连续计数，不产生事件、不改变状态。
+- **只有确定发布的读数才推进状态**：缓冲中的读数不参与；因迟到进入隔离区的读数状态永远是
+  `quarantined`，不可能被状态机看到，因此**绝不会改变告警状态或补造事件**。
+- **按来源独立**：不同来源（以及同一来源上的多条规则）各自维护独立的状态与连续计数。
+- **晚建规则等价回放**：状态机是已发布流的纯函数。规则创建时会立即按顺序回放该来源此前全部
+  已发布读数（不包括隔离读数），因此无论规则何时创建，其当前状态与历史事件都与“一开始就建好”
+  完全一致。
+- 数值来源：读数 `value` 本身是数字时直接比较；创建规则时给 `value_key`（如 `"temp"`）则从
+  对象型读数的该顶层键取值。
+
+## 跨来源复合告警语义
+
+每条复合规则声明 **2～4 个条件**，条件按声明顺序（`position`）保存；每个条件绑定会话中
+一个**互不相同**的来源，并自带方向（`above`/`below`）、阈值、可选 `value_key` 与窗口
+`window_seconds`。规则消费的是**整个会话的已发布归并流**（顺序 `(observed_at, source_id,
+seq)`），而不仅是条件来源的读数：
+
+- 每处理一条确定发布的读数，若它属于某个条件且**严格越限**（`above`：`value > threshold`；
+  `below`：`value < threshold`，相等不算），就刷新该条件的“最近命中”（记录 `seq`、
+  `observed_at`、`value`）。非数值、布尔、NaN/Infinity、缺值或缺键的读数不会命中。
+- 每次处理后（也包括不属于任何条件的来源读数——它们只推进事件时间）检查：每个条件都存在
+  命中，且命中时间与当前读数事件时间之差 **≤ 各自的 `window_seconds`**（窗口边界**含等号**，
+  恰好在界上仍然有效）。
+- 规则为 `waiting` 且全部条件满足 → 转为 `correlated`，产生**一次** `correlated_entered`
+  事件，事件锚定在完成本次复合的那条读数（`completed_by`）上，并快照各条件当时的命中
+  （`conditions` 列表，按 `position`）。
+- 已处于 `correlated` 时继续满足**不会重复事件**；只有当后续某条读数使任一条件超出自己的
+  窗口（或尚无命中）时，规则才**静默**回到 `waiting`（不产生事件），此后才能再次复合。
+- 每个条件的窗口互相独立：例如 A 的窗口 30s、B 的窗口 1s，只要 B 的命中超窗就回到等待，
+  哪怕 A 仍新鲜。
+- **只消费确定发布的读数**：缓冲读数不参与；迟到进入隔离区（`quarantined`）的读数永远不会
+  成为已发布读数，因此既不能制造复合，也不会让命中“过期”。重复上报相同读数是空操作，
+  同样不可能重复触发。
+- **晚建规则等价回放**：复合结果是已发布归并流的纯函数。规则创建时会按全局归并顺序回放该会话
+  此前全部已发布读数（不含隔离读数），其当前状态与历史事件与“一开始就建好”完全一致。
+
+## 接口
+
+### 1. 创建会话
+
+`POST /sessions`
+
+```bash
+curl -s -X POST localhost:8000/sessions -H 'Content-Type: application/json' -d '{
+  "session_id": "lab-1",
+  "source_ids": ["thermometer-a", "thermometer-b"],
+  "allowed_lateness_seconds": 10
+}'
+```
+
+`session_id` 可省略（自动生成 UUID hex）。响应 201。
+
+### 2. 批量上报读数（乱序、迟到均可）
+
+`POST /sessions/{session_id}/readings`
+
+请求体支持 `{"readings": [...]}`，也接受裸 JSON 数组：
+
+```bash
+curl -s -X POST localhost:8000/sessions/lab-1/readings \
+  -H 'Content-Type: application/json' -d '{
+  "readings": [
+    {"source_id": "thermometer-b", "seq": 2, "observed_at": "2026-09-21T10:00:20Z", "value": 21.4},
+    {"source_id": "thermometer-a", "seq": 1, "observed_at": "2026-09-21T10:00:05Z", "value": 22.1}
+  ]
+}'
+```
+
+响应汇总本批处理结果：
+
+```json
+{
+  "session_id": "lab-1",
+  "received": 2,
+  "duplicates": 0,
+  "quarantined": 0,
+  "published_now": 0,
+  "published_total": 0,
+  "buffered": 2,
+  "all_sources_reported": true,
+  "published_watermark": null
+}
+```
+
+字段：`received` 批内条数；`duplicates` 幂等重复条数；`quarantined` 本批被隔离条数；
+`published_now` 本批触发新发布的条数；`published_total` 会话累计已发布；`buffered` 仍在等待的条数。
+本批一旦有新读数发布，相关告警规则会在**同一事务**内推进并可能生成事件。
+
+错误码：未知来源/非法时间/空批次 → 400；字段结构错误（缺字段、`seq<0` 等）→ 422；
+同 key 不同 payload、向**已封存来源**或**已关闭会话**上报新 key → 409；会话不存在 → 404。
+注意：来源封存/会话关闭后，对完全相同既有读数的重试仍正常返回 200 并计入 `duplicates`。
+
+### 3. 封存来源（声明采集结束）
+
+`POST /sessions/{session_id}/sources/{source_id}/seal`
+
+```bash
+curl -s -X POST localhost:8000/sessions/lab-1/sources/thermometer-a/seal \
+  -H 'Content-Type: application/json' -d '{
+  "final_observed_at": "2026-09-21T10:05:00Z"
+}'
+```
+
+- `final_observed_at` 不得早于该来源已见的最大 `observed_at`，否则 400；
+  接受与读数上报相同的全部 ISO 8601 时间形式（统一按 UTC 归一化）。
+- **同值重试幂等**：对已封存来源用相同 `final_observed_at`（含不同写法但同一时刻，如
+  `...T12:05:00+02:00` 与 `...T10:05:00Z`）再次封存 → 200 且结果与首次完全一致
+  （`sealed_at` 不变）；用**不同**值封存 → 409。
+- 未知来源 → 400；会话不存在 → 404；请求体缺字段/为空 → 422。
+- 封存后该来源不再接受新读数（409），既有读数的相同重试仍计为 `duplicates`。
+- 封存非最后一个来源时，其 `final_observed_at` 按普通最大事件时间参与水位线推进，
+  可能立即发布一批读数；响应返回最新会话状态（结构同“会话状态”接口）。
+- **封存最后一个来源**时，响应中 `closed` 变为 `true`：全部剩余 buffered 读数已在同一事务内
+  按全局顺序发布、两类告警已推进完毕，此后任何新 key 上报均 409。
+
+### 4. 拉取已发布流
+
+`GET /sessions/{session_id}/stream?limit=100&cursor=...`
+
+- 只返回已发布读数，严格按 `(observed_at, source_id, seq)` 排序；
+- keyset 分页：响应中的 `next_cursor` 原样回传即可翻页，为 `null` 表示取完；
+- 每条读数带发布时的 `published_watermark`，响应体也带当前水位线（尾流发布时为终止水位线）。
+
+```bash
+curl -s 'localhost:8000/sessions/lab-1/stream?limit=50'
+```
+
+### 5. 查看隔离项
+
+`GET /sessions/{session_id}/quarantine?limit=100&cursor=...`
+
+按到达时间排列的迟到读数，含 `observed_at`、原始 `value` 与被拦截时的
+`quarantined_watermark`（`reason` 固定为 `behind_published_watermark`）。同样支持游标分页。
+
+```bash
+curl -s 'localhost:8000/sessions/lab-1/quarantine'
+```
+
+### 6. 会话状态（辅助接口）
+
+`GET /sessions/{session_id}`：返回来源列表、迟到容忍、是否已全部首报、
+已发布水位线与当前计算出的有效水位线，以及封存/关闭状态：
+
+- 顶层 `status`（`open`/`closed`）、布尔 `closed` 与关闭时刻 `closed_at`；
+- `sources` 数组（按会话声明顺序）逐项给出 `source_id`、已见最大事件时间 `max_observed_at`、
+  封存值 `final_observed_at`、封存时刻 `sealed_at` 与布尔 `sealed`。
+
+```json
+{
+  "session_id": "lab-1",
+  "source_ids": ["thermometer-a", "thermometer-b"],
+  "allowed_lateness_seconds": 10.0,
+  "published_watermark": "2026-09-21T09:59:50Z",
+  "all_sources_reported": true,
+  "effective_watermark": "2026-09-21T09:59:50Z",
+  "created_at": "2026-09-22T06:00:00Z",
+  "status": "open",
+  "closed": false,
+  "closed_at": null,
+  "sources": [
+    {"source_id": "thermometer-a", "max_observed_at": "2026-09-21T10:00:00Z",
+     "final_observed_at": "2026-09-21T10:00:00Z",
+     "sealed_at": "2026-09-22T06:10:00Z", "sealed": true},
+    {"source_id": "thermometer-b", "max_observed_at": "2026-09-21T10:00:00Z",
+     "final_observed_at": null, "sealed_at": null, "sealed": false}
+  ]
+}
+```
+
+### 7. 创建告警规则
+
+`POST /sessions/{session_id}/alert-rules`
+
+为一个**会话内已声明的来源**创建阈值规则。请求字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `source_id` | 会话 `source_ids` 之一；未知来源 → 400 |
+| `direction` | `above`（高于进入阈值告警）或 `below`（低于进入阈值告警） |
+| `enter_threshold` | 进入阈值（有限数值；比较为严格大于/小于） |
+| `recover_threshold` | 恢复阈值；`above` 时必须严格小于进入阈值，`below` 时必须严格大于，否则 400 |
+| `enter_consecutive` | 进入所需连续越限读数数（≥1） |
+| `recover_consecutive` | 恢复所需连续恢复读数数（≥1） |
+| `value_key` | 可选；从对象型读数中取该顶层键比较，省略则直接比较读数 `value` |
+| `rule_id` | 可选自定义 id；重复 → 409 |
+
+```bash
+curl -s -X POST localhost:8000/sessions/lab-1/alert-rules \
+  -H 'Content-Type: application/json' -d '{
+  "rule_id": "temp-high",
+  "source_id": "thermometer-a",
+  "direction": "above",
+  "enter_threshold": 30.0,
+  "recover_threshold": 25.0,
+  "enter_consecutive": 3,
+  "recover_consecutive": 2
+}'
+```
+
+响应 201，含规则当前的 `state`（`normal`/`active`）与 `streak`。若该来源此前已有已发布读数，
+创建时立即回放并可能直接返回 `active` 且生成历史事件。
+
+### 8. 查询规则
+
+- `GET /sessions/{session_id}/alert-rules`：列出会话全部规则（含当前状态）。
+- `GET /sessions/{session_id}/alert-rules/{rule_id}`：单条规则；不存在 → 404。
+
+### 9. 查询当前告警
+
+`GET /sessions/{session_id}/alerts/current?source_id=...`
+
+只返回处于 `active` 的规则，按进入时间排序。每条含进入时的触发读数详情
+（`seq`、`observed_at`、`value`、当时所用 `threshold`、服务端 `triggered_at`）
+以及规则最近处理到的读数位置。可用 `source_id` 限定来源；未知来源 → 400。
+
+```bash
+curl -s 'localhost:8000/sessions/lab-1/alerts/current'
+```
+
+### 10. 查询告警历史（分页）
+
+`GET /sessions/{session_id}/alerts/history?limit=100&cursor=...&source_id=...&rule_id=...&event_type=...`
+
+- 返回 `entered` / `recovered` 事件，**按事件 id 倒序（最新在前）**；
+- `next_cursor` 不透明游标，原样回传翻页；损坏游标 → 400；
+- 可选过滤：`source_id`（未知来源 → 400）、`rule_id`（不存在 → 404）、
+  `event_type`（仅允许 `entered`/`recovered`，否则 400）。
+
+```bash
+curl -s 'localhost:8000/sessions/lab-1/alerts/history?limit=20&event_type=entered'
+```
+
+### 11. 创建跨来源复合告警规则
+
+`POST /sessions/{session_id}/correlated-rules`
+
+请求体含 `conditions`（2～4 项）与可选 `rule_id`；每个条件字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `source_id` | 会话 `source_ids` 之一，条件之间不可重复；未知来源 → 400 |
+| `direction` | `above`（严格高于阈值命中）或 `below`（严格低于阈值命中） |
+| `threshold` | 命中阈值（有限数值，严格比较，相等不计） |
+| `window_seconds` | 该条件命中的有效时长（秒，> 0，边界含等号） |
+| `value_key` | 可选；从对象型读数中取该顶层键比较，省略则直接比较读数 `value` |
+
+```bash
+curl -s -X POST localhost:8000/sessions/lab-1/correlated-rules \
+  -H 'Content-Type: application/json' -d '{
+  "rule_id": "heatwave",
+  "conditions": [
+    {"source_id": "thermometer-a", "direction": "above", "threshold": 30.0, "window_seconds": 15},
+    {"source_id": "thermometer-b", "direction": "above", "threshold": 28.0,
+     "window_seconds": 10, "value_key": "temp"}
+  ]
+}'
+```
+
+响应 201，含规则当前 `state`（`waiting`/`correlated`）、各条件的当前 `last_hit`、
+复合锚点 `correlated_since` 以及归并流处理位置（`last_observed_at`/`last_source_id`/
+`last_seq`）。创建时立即回放，已有的已发布读数可能直接让规则返回 `correlated`。
+结构错误（条件数不在 2～4、来源重复、窗口非正、NaN 阈值等）→ 422；重复 `rule_id` → 409。
+
+### 12. 查询复合规则
+
+- `GET /sessions/{session_id}/correlated-rules`：列出会话全部复合规则（含各条件最近命中）。
+- `GET /sessions/{session_id}/correlated-rules/{rule_id}`：单条规则；不存在 → 404。
+
+### 13. 查询当前复合命中
+
+`GET /sessions/{session_id}/correlated-alerts/current`
+
+只返回处于 `correlated` 的规则，按复合完成时间排序。每条含 `correlated_entered`：
+完成读数 `completed_by`（`source_id`/`seq`/`observed_at`）、完成时刻各条件命中快照
+`conditions`（含位置、方向、阈值、窗口、命中读数与取值）以及服务端 `triggered_at`。
+
+```bash
+curl -s 'localhost:8000/sessions/lab-1/correlated-alerts/current'
+```
+
+### 14. 查询复合事件历史（分页）
+
+`GET /sessions/{session_id}/correlated-alerts/history?limit=100&cursor=...&rule_id=...`
+
+- 返回 `correlated_entered` 事件，**按事件 id 倒序（最新在前）**；
+- `next_cursor` 不透明游标，原样回传翻页；损坏游标 → 400；
+- 可选 `rule_id` 过滤（规则不存在 → 404）；会话不存在 → 404。
+
+```bash
+curl -s 'localhost:8000/sessions/lab-1/correlated-alerts/history?limit=20'
+```
+
+### 15. 创建消费者检查点
+
+`POST /sessions/{session_id}/checkpoints`
+
+为会话已发布读数流的某个消费者记录一个**检查点**。请求体 `{"name": "..."}`：
+名称在会话内唯一，允许字母、数字、`.`、`_`、`-`（须以字母/数字开头，最长 128）。
+
+创建在**同一个 `BEGIN IMMEDIATE` 事务（同一只读快照）**内记录两件事：
+
+- 当前发布流**位置**：已发布读数条数 `stream_offset`，以及最后一条已发布读数的
+  确定顺序键 `(last_observed_at, last_source_id, last_seq)`（首条发布前三者为
+  `null`、偏移为 0）；
+- 该时刻会话的 `published_watermark`。
+
+```bash
+curl -s -X POST localhost:8000/sessions/lab-1/checkpoints \
+  -H 'Content-Type: application/json' -d '{"name": "consumer-1"}'
+```
+
+响应 201。**幂等与冲突**：
+
+- 同名检查点在**位置相同**时重复创建是幂等的，返回 200 与首次完全一致的结果
+  （`created_at`、记录的水位线均不变）；
+- 发布流已推进到**不同位置**后再创建同名检查点 → 409，且既有检查点绝不被改写。
+  注意幂等只取决于**位置**：水位线可能在没有新读数发布时前移（读数仍停在边界外），
+  此时重复创建仍返回首次快照。
+
+会话不存在 → 404；名称非法（空、含空格/斜杠等）或缺字段 → 422。
+检查点行一旦写入即为**不可变快照**：后续发布、来源封存乃至会话关闭都不会修改它。
+
+### 16. 列出 / 删除检查点
+
+- `GET /sessions/{session_id}/checkpoints`：列出会话全部检查点（按创建时间、名称排序），
+  每项含完整位置与水位线快照；会话不存在 → 404。
+- `DELETE /sessions/{session_id}/checkpoints/{name}`：删除一个检查点，成功 → 204；
+  检查点不存在 → 404，会话不存在 → 404。删除后该名称可重新创建。
+
+```bash
+curl -s localhost:8000/sessions/lab-1/checkpoints
+curl -s -X DELETE localhost:8000/sessions/lab-1/checkpoints/consumer-1
+```
+
+### 17. 从检查点继续读取
+
+`GET /sessions/{session_id}/checkpoints/{name}/stream?limit=100&cursor=...`
+
+- 沿用“拉取已发布流”的**确定顺序** `(observed_at, source_id, seq)` 与**不透明游标分页**
+  （`next_cursor` 原样回传，`null` 取完；`limit` 1～1000；损坏游标 → 400）。
+- 不带 `cursor` 时，首页从检查点捕获位置的**严格之后**开始（空流检查点等价于从头读）；
+  之后翻页把上一页的 `next_cursor` 原样回传。**游标不得指向检查点位置或其之前**（→ 400）。
+- 响应内嵌不可变的 `checkpoint` 快照；顶层 `published_watermark` 是会话**当前**水位线
+  （尾流发布后为终止水位线），与检查点记录的快照水位线各自独立。
+- 检查点含义不随后续发布或会话关闭改变：尾流发布、会话 `closed` 之后从同一检查点继续读，
+  恢复点仍然是创建时的位置，只会多读之后（含尾流）发布的读数；隔离读数永不出现。
+
+```bash
+curl -s 'localhost:8000/sessions/lab-1/checkpoints/consumer-1/stream?limit=50'
+```
+
+检查点不存在 → 404，会话不存在 → 404。
+
+### 18. 计算释放计划（只读）
+
+`GET /sessions/{session_id}/release-plan?count=N`
+
+为 **open** 会话只读计算：要按全局顺序 `(observed_at, source_id, seq)` 释放最早 N 条
+buffered 读数，各来源的事件时钟最少需要推进到哪里。整个计算在**同一个 SQLite 读快照**
+内完成（缓冲前缀、各来源时钟与迟到容忍来自同一一致视图），不写任何数据：
+
+- **目标水位线** = 第 N 条 buffered 读数 `observed_at` 的**下一微秒**（发布规则是严格
+  小于、存储精度为微秒，这是能放出该读数的最小水位线）；已发布/已隔离读数不参与。
+- 各来源所需 effective max `required` = 目标水位线 + `allowed_lateness_seconds`
+  （水位线 = 最慢来源时钟 − 迟到容忍，因此每个来源的时钟都必须到达这里）。
+- 逐来源返回（按会话声明顺序）：`current`（当前有效时钟，封存来源为其
+  `final_observed_at`；从未上报的来源为 `null`）、`required`、`advance_seconds`
+  （还需推进的秒数，已达标为 0）与 `blocker`。
+- `blocker` 取值：`null` 已达标；`below_required` 时钟不足、按 `advance_seconds`
+  推进即可；`not_reported` 尚未首报（`current`/`advance_seconds` 均为 `null`）。
+- **已封存来源时钟不足时不得建议推进**：其 `advance_seconds` 为 `null`、`blocker`
+  为 `sealed_below_required`，且顶层 `attainable=false`、`reason` 说明原因
+  （封存时钟已不可再推进，靠推进时钟无法释放这些读数）。
+- `count` 限 1～100；超过当前 buffered 条数 → 422；会话已 `closed` → 409
+  （关闭时尾流发布已清空缓冲区）；会话不存在 → 404。
+
+```bash
+curl -s 'localhost:8000/sessions/lab-1/release-plan?count=2'
+```
+
+```json
+{
+  "session_id": "lab-1",
+  "count": 2,
+  "buffered": 4,
+  "allowed_lateness_seconds": 10.0,
+  "target_watermark": "2026-09-21T10:00:30.000001Z",
+  "attainable": true,
+  "reason": null,
+  "sources": [
+    {"source_id": "thermometer-a", "current": "2026-09-21T10:00:40Z",
+     "required": "2026-09-21T10:00:40.000001Z", "advance_seconds": 0.000001,
+     "blocker": "below_required"},
+    {"source_id": "thermometer-b", "current": "2026-09-21T10:01:00Z",
+     "required": "2026-09-21T10:00:40.000001Z", "advance_seconds": 0.0,
+     "blocker": null}
+  ]
+}
+```
+
+### 19. 检查点安全的存储清理（retention）
+
+`POST /sessions/{session_id}/retention`
+
+回收旧读数占用的存储，同时保证任何检查点的续读语义不受破坏。请求体：
+
+| 字段 | 说明 |
+| --- | --- |
+| `cutoff` | 事件时间边界（ISO 8601，统一按 UTC 归一化）；只考虑 `observed_at` **严格早于**它的读数 |
+| `dry_run` | `true`（默认）只报告数量、不写数据；`false` 在单个写事务内原子删除可删除候选 |
+
+**候选范围**：只有状态为 `published` 与 `quarantined` 的读数参与；`buffered` 读数仍可能被
+水位线发布并驱动告警状态机，**永远不是候选、永远不会被删除**。
+
+**检查点保护规则（仅作用于 published 候选）**：检查点续读返回确定顺序键
+`(observed_at, source_id, seq)` **严格大于**检查点捕获键的全部已发布读数。因此只需保留
+**会话最早检查点**（按捕获位置 `(stream_offset, last_observed_at, last_source_id,
+last_seq)` 排序最靠前者）还可能读到的读数：
+
+- 已发布候选的键**严格大于**最早检查点键 → **保留**（该检查点续读仍会返回它们，更晚的
+  检查点自然也被覆盖）；
+- 边界键本身（检查点创建时已覆盖的最后一条）及其之前的候选 → 可删除，任何续读都不会
+  再返回；
+- **会话没有任何检查点** → 没有检查点流可服务，全部 published 候选均可删除
+  （`protected_by_checkpoint` 为 `null`）；
+- 最早检查点创建于**空流**（`stream_offset=0`、键为 `null`）→ 续读从头开始，**所有**
+  published 读数都受保护；
+- `quarantined` 候选不属于发布流、检查点永远读不到，**一律可删除**。
+
+响应同时给出总数与分状态明细。`dry_run=true`：
+
+```bash
+curl -s -X POST localhost:8000/sessions/lab-1/retention \
+  -H 'Content-Type: application/json' -d '{
+    "cutoff": "2026-09-21T10:00:35Z",
+    "dry_run": true
+  }'
+```
+
+```json
+{
+  "session_id": "lab-1",
+  "cutoff": "2026-09-21T10:00:35Z",
+  "dry_run": true,
+  "deleted": 0,
+  "protected_by_checkpoint": {
+    "checkpoint_name": "consumer-1",
+    "stream_offset": 2,
+    "last_observed_at": "2026-09-21T10:00:10Z",
+    "last_source_id": "thermometer-b",
+    "last_seq": 1
+  },
+  "candidates": 4,
+  "retained": 1,
+  "deletable": 3,
+  "by_status": {
+    "published":    {"candidates": 3, "retained": 1, "deletable": 2},
+    "quarantined":  {"candidates": 1, "retained": 0, "deletable": 1}
+  }
+}
+```
+
+字段：`candidates` 事件时间严格早于 cutoff 的 published/quarantined 总数；
+`retained` 其中因最早检查点仍可能读到而保留的数量；`deletable = candidates - retained`。
+`protected_by_checkpoint` 即检查点保护边界（名称、捕获偏移与键）；无检查点时为 `null`，
+此时没有任何 published 读数受保护。
+
+确认执行时把 `dry_run` 改为 `false`：隔离与已发布候选的 `DELETE` 与计数在**同一个
+`BEGIN IMMEDIATE` 写事务**内完成，`deleted` 返回实际删除行数（等于该次调用的
+`deletable`），任何失败都整体回滚、数据不变。
+
+- **幂等**：相同请求重复提交，候选已在上次删除，第二次返回 `deleted=0`、`deletable=0`，
+  且再无副作用（两个相同执行并发也被串行化为“一次删除 + 一次空操作”）。
+- **语义不变**：清理只删除 `readings` 行；不写 `sessions` / `session_sources` /
+  告警表 / `checkpoints`，因此已发布水位线、有效水位线、来源封存/关闭状态、告警当前态
+  与历史事件、检查点不可变快照及续读结果全部保持不变（删除只可能让 `/stream` 变短，
+  受保护的检查点续读窗口一条不少）。
+- `open` 与 `closed` 会话均可清理；会话不存在 → 404；`cutoff` 非法/为空 → 400/422。
+
+```bash
+curl -s -X POST localhost:8000/sessions/lab-1/retention \
+  -H 'Content-Type: application/json' -d '{
+    "cutoff": "2026-09-21T10:00:35Z",
+    "dry_run": false
+  }'
+```
+
+## 数据库迁移
+
+建表采用“**幂等基础 schema + 版本化迁移**”：应用启动（FastAPI lifespan）时自动创建
+基础表（`CREATE TABLE IF NOT EXISTS`），并按 `schema_migrations` 表记录的版本号依次执行
+尚未应用的迁移；每个迁移与其版本登记在同一个 `BEGIN IMMEDIATE` 事务内提交。
+因此老版本数据库会在下次启动时**原地升级、不丢数据**，新数据库则直接建到最新版本，
+无需手工初始化。当前迁移版本：
+
+- **v1**：跨来源复合告警的三张表（`correlated_rules` / `correlated_conditions` /
+  `correlated_events`）。
+- **v2**：有限采集会话封存——`sessions` 增加 `status`（`open`/`closed`）与 `closed_at`，
+  `session_sources` 增加 `final_observed_at` 与 `sealed_at`（老库升级后既有会话为
+  `open`、各来源未封存，行为不变）。
+- **v3**：发布流消费者检查点——新增 `checkpoints` 表（`(session_id, name)` 主键），
+  保存创建时同一快照内的发布流位置（`stream_offset` 与最后一条已发布读数的
+  `(last_observed_at, last_source_id, last_seq)` 键）和 `published_watermark`；
+  检查点行不可变，后续发布/封存/关闭均不改写它。
+
+## 端到端示例（来源封存与尾流发布）
+
+两个温度计，迟到容忍 10s。封存前后读数的命运：
+
+| 时刻/动作 | 结果 |
+| --- | --- |
+| A 上报 seq=1@:00、seq=2@:10；B 上报 seq=1@:20 | WM=:00，三条全部 buffered |
+| 封存 A `final_observed_at=:10` | A 封存；最慢来源仍为 A@:10，WM=:00，会话保持 `open` |
+| A 再上报 seq=3（任意时间） | **409**（新 key 拒绝）；重试 seq=2 同 payload → `duplicates=1` |
+| 再次封存 A 同值 :10 | 幂等 200，`sealed_at` 不变；改值封存 → **409** |
+| 封存 B `final_observed_at=:20`（最后一个来源） | 同一事务尾流发布：终止水位线 :20.000001，三条 buffered 全部按 `(observed_at, source_id, seq)` 发布；两类告警推进；会话 **closed** |
+| close 后上报 B seq=2 | **409 closed**；重试 B seq=1 同 payload → 仍计 `duplicates` |
+
+封存非最后一个来源时水位线完全沿用普通语义：例如上例若 B 在 A 封存后先把自己的
+`final_observed_at` 声明到 :40，则最慢来源变为 A@:10、WM 推进到 :00:00，seq=1@:00
+会在封存 B 的请求中被正常发布，而无需等待会话关闭。
+
+## 端到端示例（滞回 + 连续次数）
+
+规则：`above`，进入阈值 30、恢复阈值 25，连续进入 3 次、连续恢复 2 次。
+温度计 A 的读数只有在被水位线确定发布后才被消费：
+
+| 已发布读数 | 计数/状态 |
+| --- | --- |
+| 31, 31 | 越限计数 2，仍 normal |
+| 28（滞回带内：25 < 28 ≤ 30） | 越限计数清零，仍 normal |
+| 31, 31, 31 | 第 3 次连续越限 → **entered**，转 active |
+| 24 | 恢复计数 1 |
+| 27 | 仍在滞回带内，恢复计数清零，保持 active |
+| 24, 23 | 连续 2 次严格低于 25 → **recovered**，转 normal |
+
+期间任何因迟到而被隔离的高温读数都不会触发或延长告警。
+
+## 端到端示例（跨来源同时越限）
+
+复合规则：两个来源都 `above`，A 阈值 30/窗口 15s，B 阈值 28/窗口 10s。
+读数在被水位线确定发布后按归并顺序逐条驱动规则：
+
+| 已发布归并流（事件时间） | 规则状态 |
+| --- | --- |
+| A@:00 = 31（命中 A） | `waiting`（B 尚无命中） |
+| B@:05 = 29（命中 B；A 命中年龄 5s ≤ 15s，B 新鲜） | → **correlated_entered**，锚定 B@:05 |
+| A@:12 = 31、B@:13 = 29 | 仍 `correlated`，**不重复事件** |
+| C@:20 = 0（C 不参与规则，只推进事件时间） | B 命中年龄 15s > 10s → 静默回 `waiting` |
+| A@:21 = 31、B@:21 = 29 | 两个条件同时在窗内 → 再次 **correlated_entered** |
+
+期间任何因迟到而被隔离的读数都不会参与复合或使命中过期。
+
+## 项目结构
+
+```
+.
+├── app/
+│   ├── main.py          # FastAPI 路由、异常映射
+│   ├── service.py       # 水位线计算 / 发布 / 隔离 / 幂等等核心逻辑
+│   ├── alerts.py        # 单来源告警状态机、规则创建（回放）、当前/历史查询
+│   ├── correlated.py    # 跨来源复合规则、窗口命中维护、回放、当前/历史查询
+│   ├── checkpoints.py   # 发布流消费者检查点：创建（同快照位置+水位线）/列表/删除/继续读取
+│   ├── release_plan.py  # 释放计划：同一读快照内计算放出最早 N 条 buffered 读数的最小时钟推进
+│   ├── retention.py     # 检查点安全清理：dry_run 报告/单事务原子删除 cutoff 之前的已发布与隔离读数
+│   ├── errors.py        # 400/404/409/422 业务异常
+│   ├── cursor.py        # 不透明 keyset 分页游标
+│   ├── database.py      # SQLite schema、版本化迁移、连接、BEGIN IMMEDIATE 事务
+│   ├── models.py        # Pydantic 请求/响应模型
+│   ├── time_utils.py    # ISO 8601 解析与 UTC 规范化
+│   └── config.py        # 环境变量配置
+├── tests/
+│   ├── test_api.py          # 时间线/隔离/幂等等端到端行为测试（22 个）
+│   ├── test_alerts.py       # 单来源告警状态机/滞回/连续次数/隔离/回放/分页测试（27 个）
+│   ├── test_correlated.py   # 跨来源复合/窗口/过期/再触发/隔离/回放/迁移测试（35 个）
+│   ├── test_sealing.py      # 来源封存/幂等冲突/尾流发布/关闭/封存-上报并发测试（25 个）
+│   ├── test_checkpoints.py  # 检查点创建/幂等/409/继续读取分页/不可变/迁移测试（39 个）
+│   ├── test_release_plan.py # 释放计划目标水位线/逐来源推进/封存不可达/422/409/并发只读测试（19 个）
+│   └── test_retention.py    # 检查点安全清理：dry_run/保护边界/原子删除/幂等/不改变既有语义测试（28 个）
+├── Dockerfile
+├── docker-compose.yml
+└── requirements.txt
+```
