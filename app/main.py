@@ -1,14 +1,16 @@
 """FastAPI application: lab sensor timeline merge API."""
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
 from fastapi import Depends, FastAPI, Query, Request, Response
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 
-from . import alerts, checkpoints, correlated, release_plan, retention, service
+from . import alerts, checkpoints, correlated, quarantine_audit, release_plan, retention, service
 from .config import settings
 from .database import get_db, init_db
 from .models import (
@@ -29,6 +31,8 @@ from .models import (
     CurrentAlertsResponse,
     CurrentCorrelatedAlertsResponse,
     PullResponse,
+    QuarantineAuditIn,
+    QuarantineAuditResponse,
     QuarantineResponse,
     ReadingIn,
     ReleasePlanResponse,
@@ -50,7 +54,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Lab Sensor Timeline Merge API",
-    version="1.6.0",
+    version="1.7.0",
     description=(
         "Out-of-order sensor reporting with per-session fixed source lists, "
         "a slowest-source watermark (minus allowed lateness), deterministic "
@@ -64,7 +68,9 @@ app = FastAPI(
         "their own thresholds together inside a shared event-time window. A "
         "read-only release-plan endpoint computes, in one snapshot, the "
         "minimal per-source clock advancement needed to release the earliest "
-        "N buffered readings."
+        "N buffered readings, and a read-only quarantine-audit endpoint "
+        "rehearses where each quarantined reading would be inserted back into"
+        " the published timeline and which earliest checkpoint it would affect."
     ),
     lifespan=lifespan,
 )
@@ -219,6 +225,63 @@ def pull_quarantine(
 ) -> QuarantineResponse:
     """Late readings that arrived behind the already-published watermark."""
     return QuarantineResponse(**service.list_quarantined(conn, session_id, limit, cursor))
+
+
+@app.post(
+    "/sessions/{session_id}/quarantine-audit",
+    response_model=QuarantineAuditResponse,
+    tags=["readings"],
+)
+async def quarantine_impact_audit(
+    session_id: str,
+    request: Request,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> QuarantineAuditResponse:
+    """Read-only impact rehearsal for the session's quarantined readings.
+
+    For each quarantined reading (optionally filtered by ``source_id`` and an
+    inclusive event-time interval ``from``/``to``, capped at ``limit``) the
+    response shows where it would land in the published timeline if it could
+    be inserted by event time: the 0-based insertion position, the previous
+    and next published neighbour keysets, the event-time gaps to them, and the
+    earliest checkpoint whose resume window would contain the insertion.
+    Every input row is derived inside one SQLite read snapshot and ordered
+    stably by ``(observed_at, source_id, seq)``.  Nothing is written: the
+    published stream, watermarks, alerts and checkpoints are never modified.
+    The JSON body is optional (``{}`` or an empty body uses the defaults);
+    malformed JSON returns 400, an undeclared ``source_id`` / inverted or
+    unparseable interval / out-of-range ``limit`` returns 400, and an unknown
+    session returns 404.
+    """
+    raw = await request.body()
+    if not raw:
+        body = QuarantineAuditIn()
+    else:
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            return _error(400, "request body must be valid JSON")
+        if not isinstance(payload, dict):
+            return _error(400, "body must be a JSON object")
+        # bool is a JSON number-compatible value that Pydantic coerces to int;
+        # validate it on the raw payload so the limit contract returns 400.
+        if "limit" in payload and isinstance(payload["limit"], bool):
+            return _error(400, "limit must be an integer between 1 and 1000")
+        try:
+            body = QuarantineAuditIn(**payload)
+        except Exception as exc:
+            detail = exc.errors() if hasattr(exc, "errors") else str(exc)
+            return _error(422, jsonable_encoder(detail))
+
+    result = quarantine_audit.audit_quarantine(
+        conn,
+        session_id,
+        source_id=body.source_id,
+        from_iso=body.from_,
+        to_iso=body.to,
+        limit=body.limit,
+    )
+    return QuarantineAuditResponse(**result)
 
 
 @app.get(

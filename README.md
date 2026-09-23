@@ -32,6 +32,14 @@ buffered 读数按既定全局顺序一次性发布（**尾流发布**）、推�
 **同一个 `BEGIN IMMEDIATE` 写事务**内原子删除；重复请求幂等，失败整体回滚，
 且不改变水位线、告警与检查点的任何语义。
 
+此外还提供只读的**隔离影响预演**接口
+`POST /sessions/{session_id}/quarantine-audit`：在同一个 SQLite 读快照内，对每条
+（可按 `source_id` 与含端点的事件时间区间 `from`/`to` 过滤、可按 `limit` 截断的）
+隔离读数，按确定顺序 `(observed_at, source_id, seq)` 计算“若按事件时间插回已发布流，
+它应位于哪两个已发布邻居之间”，给出插入位置、前后邻居键、与二者的事件时间差，并标出
+**受影响的最早检查点**名称（即捕获键严格位于插入点之前、续读窗口会包含该读数的那个
+检查点；没有则为 `null`）。整个预演不写任何数据，发布流、告警、检查点与水位线均不变。
+
 - 语言/框架：Python 3.11 · FastAPI · Uvicorn
 - 存储：SQLite（WAL 模式，单文件，零外部依赖）
 - 并发：写操作在 `BEGIN IMMEDIATE` 事务内串行化，水位线推进单调、发布只发生一次，
@@ -69,7 +77,7 @@ docker compose up --build
 ```bash
 python3 -m pip install -r requirements.txt
 SENSOR_DB_PATH=./sensors.db uvicorn app.main:app --reload --port 8000
-pytest -q        # 运行 195 个端到端行为测试（需 pytest、httpx）
+pytest -q        # 运行 238 个端到端行为测试（需 pytest、httpx）
 ```
 
 ## 时间线语义
@@ -603,6 +611,94 @@ curl -s -X POST localhost:8000/sessions/lab-1/retention \
   }'
 ```
 
+### 20. 隔离影响预演（只读）
+
+`POST /sessions/{session_id}/quarantine-audit`
+
+对隔离区读数做“若按事件时间插回已发布流会落在何处”的**只读影响预演**。整个计算在
+**同一个 SQLite 读快照**内完成（隔离行、已发布流、检查点行来自同一一致视图），
+不写任何数据：已发布流、水位线、两类告警状态机与检查点都**绝不被修改**。
+
+请求体为 JSON 对象，**可整体省略或传 `{}`**，字段全部可选：
+
+| 字段 | 说明 |
+| --- | --- |
+| `source_id` | 只预演该来源的隔离读数；必须是会话已声明来源，否则 400 |
+| `from` | 事件时间下界（ISO 8601，统一按 UTC 归一化），**含端点** |
+| `to` | 事件时间上界（ISO 8601，同上），**含端点**；`from` 晚于 `to` → 400 |
+| `limit` | 最多返回条数，默认 100、范围 1～1000；越界（含布尔值）→ 400，非整数 → 422 |
+
+对每条命中的隔离读数，按确定顺序 `(observed_at, source_id, seq)` 计算其假设插入位置：
+
+- `insertion.position`：已发布流中键严格小于该读数的条数（**0 基**；0 = 插在整个流最前，
+  等于已发布总数 = 插在末尾）。同一 `observed_at` 上的先后完全由 `(source_id, seq)`
+  决定，顺序稳定、与 `/stream` 完全一致。
+- `insertion.previous` / `insertion.next`：插入点前后的**已发布邻居键**
+  （`observed_at`/`source_id`/`seq`）；位于流首/流尾时对应一端为 `null`。
+  邻居只在**已发布**读数之间选取（其他隔离读数不参与）。
+- `insertion.seconds_after_previous` / `seconds_before_next`：与前后邻居的**事件时间差**
+  （秒，浮点数；流首/流尾的缺失一侧为 `null`）。与已发布读数时间相同（或同刻排序）时
+  差值为 `0`。
+- `affected_checkpoint`：**受影响的最早检查点**——即捕获键严格位于插入点之前的那个
+  最早检查点（按捕获位置 `(stream_offset, last_observed_at, last_source_id,
+  last_seq)` 排序最靠前者，与 retention 的保护边界同源）。检查点续读返回其捕获键
+  **严格之后**的全部已发布键，因此插入点一旦落在它之后，续读窗口就会包含该读数；
+  空流检查点（`stream_offset=0`、键为 `null`）先于任何读数、对每条都受影响。
+  没有任何检查点先于插入点时为 `null`。
+
+结果按 `(observed_at, source_id, seq)` **稳定排序**返回；顶层 `matched` 是本次返回条数
+（≤ `limit`），`total_matched` 是同一快照内命中过滤条件的隔离读数总数（被截断时更大）。
+
+```bash
+curl -s -X POST localhost:8000/sessions/lab-1/quarantine-audit \
+  -H 'Content-Type: application/json' -d '{
+    "from": "2026-09-21T10:00:00Z",
+    "to":   "2026-09-21T10:01:00Z",
+    "limit": 50
+  }'
+```
+
+```json
+{
+  "session_id": "lab-1",
+  "source_id": null,
+  "from": "2026-09-21T10:00:00Z",
+  "to": "2026-09-21T10:01:00Z",
+  "limit": 50,
+  "matched": 1,
+  "total_matched": 1,
+  "readings": [
+    {
+      "source_id": "thermometer-a",
+      "seq": 9,
+      "observed_at": "2026-09-21T10:00:05Z",
+      "value": 99.0,
+      "quarantined_watermark": "2026-09-21T10:00:10Z",
+      "insertion": {
+        "position": 2,
+        "previous": {"observed_at": "2026-09-21T10:00:00Z", "source_id": "thermometer-b", "seq": 1},
+        "next":     {"observed_at": "2026-09-21T10:00:10Z", "source_id": "thermometer-a", "seq": 2},
+        "seconds_after_previous": 5.0,
+        "seconds_before_next": 5.0
+      },
+      "affected_checkpoint": {
+        "name": "consumer-1",
+        "stream_offset": 2,
+        "last_observed_at": "2026-09-21T10:00:00Z",
+        "last_source_id": "thermometer-b",
+        "last_seq": 1
+      }
+    }
+  ]
+}
+```
+
+- **只读保证**：预演只发起读事务；重复调用、与上报并发调用都不会改变任何表，
+  已发布流、隔离区、水位线、告警、检查点内容前后逐字节一致。
+- `open` 与 `closed` 会话均可预演；会话不存在 → 404；未知 `source_id`、非法
+  `from`/`to`（含空串）、`from` 晚于 `to`、`limit` 越界或为布尔值 → 400；
+  请求体不是合法 JSON / 不是 JSON 对象 → 400；字段结构错误（如 `limit` 为字符串）→ 422。
+
 ## 数据库迁移
 
 建表采用“**幂等基础 schema + 版本化迁移**”：应用启动（FastAPI lifespan）时自动创建
@@ -681,6 +777,7 @@ curl -s -X POST localhost:8000/sessions/lab-1/retention \
 │   ├── checkpoints.py   # 发布流消费者检查点：创建（同快照位置+水位线）/列表/删除/继续读取
 │   ├── release_plan.py  # 释放计划：同一读快照内计算放出最早 N 条 buffered 读数的最小时钟推进
 │   ├── retention.py     # 检查点安全清理：dry_run 报告/单事务原子删除 cutoff 之前的已发布与隔离读数
+│   ├── quarantine_audit.py # 隔离影响预演（只读）：读快照内计算隔离读数插回已发布流的位置/邻居/最早受影响检查点
 │   ├── errors.py        # 400/404/409/422 业务异常
 │   ├── cursor.py        # 不透明 keyset 分页游标
 │   ├── database.py      # SQLite schema、版本化迁移、连接、BEGIN IMMEDIATE 事务
@@ -694,7 +791,8 @@ curl -s -X POST localhost:8000/sessions/lab-1/retention \
 │   ├── test_sealing.py      # 来源封存/幂等冲突/尾流发布/关闭/封存-上报并发测试（25 个）
 │   ├── test_checkpoints.py  # 检查点创建/幂等/409/继续读取分页/不可变/迁移测试（39 个）
 │   ├── test_release_plan.py # 释放计划目标水位线/逐来源推进/封存不可达/422/409/并发只读测试（19 个）
-│   └── test_retention.py    # 检查点安全清理：dry_run/保护边界/原子删除/幂等/不改变既有语义测试（28 个）
+│   ├── test_retention.py    # 检查点安全清理：dry_run/保护边界/原子删除/幂等/不改变既有语义测试（28 个）
+│   └── test_quarantine_audit.py # 隔离影响预演：插入位置/邻居/时间差/最早受影响检查点/过滤/分页/400/404/只读测试（43 个）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

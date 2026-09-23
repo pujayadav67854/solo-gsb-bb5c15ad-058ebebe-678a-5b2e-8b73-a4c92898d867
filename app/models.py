@@ -545,6 +545,113 @@ class ReleasePlanResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# read-only quarantine impact rehearsal
+# ---------------------------------------------------------------------------
+
+class QuarantineAuditIn(BaseModel):
+    """Optional body for ``POST .../quarantine-audit``; every field is optional."""
+
+    source_id: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        description="Restrict the rehearsal to one declared source of the session",
+    )
+    from_: Optional[str] = Field(
+        default=None,
+        alias="from",
+        description="Inclusive lower bound on quarantined readings' event time (ISO 8601)",
+    )
+    to: Optional[str] = Field(
+        default=None,
+        description="Inclusive upper bound on quarantined readings' event time (ISO 8601)",
+    )
+    limit: Optional[int] = Field(
+        default=None,
+        description="Maximum rehearsed readings (default 100, 1..1000); out of range -> 400",
+    )
+
+    model_config = {"populate_by_name": True}
+
+    @field_validator("source_id")
+    @classmethod
+    def _source_not_blank(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and not v.strip():
+            raise ValueError("source_id must not be blank")
+        return v
+
+
+class TimelineKeyOut(BaseModel):
+    observed_at: str
+    source_id: str
+    seq: int
+
+
+class QuarantineInsertionOut(BaseModel):
+    position: int = Field(
+        ...,
+        description=(
+            "Hypothetical 0-based position in the published stream: the number"
+            " of published readings with a strictly smaller keyset"
+        ),
+    )
+    previous: Optional[TimelineKeyOut] = Field(
+        None, description="Published neighbour immediately before the insertion point"
+    )
+    next: Optional[TimelineKeyOut] = Field(
+        None, description="Published neighbour immediately after the insertion point"
+    )
+    seconds_after_previous: Optional[float] = Field(
+        None,
+        description="Event-time distance from the previous published neighbour (null at the head)",
+    )
+    seconds_before_next: Optional[float] = Field(
+        None,
+        description="Event-time distance to the next published neighbour (null at the tail)",
+    )
+
+
+class AffectedCheckpointOut(BaseModel):
+    name: str = Field(
+        ...,
+        description=(
+            "Earliest checkpoint whose captured keyset precedes the insertion"
+            " point, so the inserted reading would land in its resume window"
+        ),
+    )
+    stream_offset: int
+    last_observed_at: Optional[str] = None
+    last_source_id: Optional[str] = None
+    last_seq: Optional[int] = None
+
+
+class QuarantineAuditItemOut(BaseModel):
+    source_id: str
+    seq: int
+    observed_at: str
+    value: Optional[Any] = None
+    quarantined_watermark: str
+    insertion: QuarantineInsertionOut
+    affected_checkpoint: Optional[AffectedCheckpointOut] = None
+
+
+class QuarantineAuditResponse(BaseModel):
+    session_id: str
+    source_id: Optional[str] = None
+    from_: Optional[str] = Field(default=None, alias="from")
+    to: Optional[str] = None
+    limit: int
+    matched: int = Field(
+        ..., description="Readings in this response (<= limit, == total_matched unless capped)"
+    )
+    total_matched: int = Field(
+        ..., description="Quarantined rows matching the filters in the same snapshot"
+    )
+    readings: list[QuarantineAuditItemOut]
+
+    model_config = {"populate_by_name": True}
+
+
+# ---------------------------------------------------------------------------
 # checkpoint-safe storage retention
 # ---------------------------------------------------------------------------
 
