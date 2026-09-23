@@ -8,7 +8,15 @@ from typing import Any, Optional
 from fastapi import Depends, FastAPI, Query, Request, Response
 from fastapi.responses import JSONResponse
 
-from . import alerts, checkpoints, correlated, release_plan, retention, service
+from . import (
+    alerts,
+    checkpoints,
+    correlated,
+    quarantine_audit,
+    release_plan,
+    retention,
+    service,
+)
 from .config import settings
 from .database import get_db, init_db
 from .models import (
@@ -29,6 +37,7 @@ from .models import (
     CurrentAlertsResponse,
     CurrentCorrelatedAlertsResponse,
     PullResponse,
+    QuarantineAuditResponse,
     QuarantineResponse,
     ReadingIn,
     ReleasePlanResponse,
@@ -50,7 +59,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Lab Sensor Timeline Merge API",
-    version="1.6.0",
+    version="1.7.0",
     description=(
         "Out-of-order sensor reporting with per-session fixed source lists, "
         "a slowest-source watermark (minus allowed lateness), deterministic "
@@ -64,7 +73,10 @@ app = FastAPI(
         "their own thresholds together inside a shared event-time window. A "
         "read-only release-plan endpoint computes, in one snapshot, the "
         "minimal per-source clock advancement needed to release the earliest "
-        "N buffered readings."
+        "N buffered readings. A read-only quarantine-audit endpoint previews, "
+        "in one snapshot, where each quarantined reading would land if it "
+        "were inserted into the published timeline by event time, which "
+        "published neighbours and checkpoint it would affect."
     ),
     lifespan=lifespan,
 )
@@ -219,6 +231,52 @@ def pull_quarantine(
 ) -> QuarantineResponse:
     """Late readings that arrived behind the already-published watermark."""
     return QuarantineResponse(**service.list_quarantined(conn, session_id, limit, cursor))
+
+
+@app.post(
+    "/sessions/{session_id}/quarantine-audit",
+    response_model=QuarantineAuditResponse,
+    tags=["readings"],
+)
+async def quarantine_impact_audit(
+    session_id: str,
+    request: Request,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> QuarantineAuditResponse:
+    """Read-only impact rehearsal for the session's quarantined readings.
+
+    The optional JSON body may carry ``source_id`` (one declared source),
+    inclusive event-time bounds ``from`` / ``to`` and a ``limit``
+    (1-1000, default 100).  Inside one SQLite read snapshot, every matching
+    quarantined reading is placed against the current published timeline in
+    deterministic ``(observed_at, source_id, seq)`` order: the response
+    reports its zero-based insertion position, the predecessor/successor
+    published keysets, the event-time gaps to them and the earliest
+    checkpoint whose resume would gain the reading.  Nothing is published,
+    quarantined, alerted or checkpointed -- the call never writes.  Malformed
+    JSON, a non-object body, an invalid interval/limit or an undeclared
+    source return 400; an unknown session returns 404.
+    """
+    # ``from``/``to``/``limit``/``source_id`` are all optional; every semantic
+    # error must be 400 (not Pydantic's 422), so the body is parsed here and
+    # validated inside the audit module, like the readings endpoint.
+    try:
+        body = await request.json()
+    except Exception:
+        return _error(400, "request body must be valid JSON")
+    if not isinstance(body, dict):
+        return _error(400, "body must be a JSON object")
+
+    # TimestampError and ServiceError are handled by the registered handlers.
+    result = quarantine_audit.quarantine_audit(
+        conn,
+        session_id,
+        source_id=body.get("source_id"),
+        from_=body.get("from"),
+        to=body.get("to"),
+        limit=body.get("limit"),
+    )
+    return QuarantineAuditResponse(**result)
 
 
 @app.get(

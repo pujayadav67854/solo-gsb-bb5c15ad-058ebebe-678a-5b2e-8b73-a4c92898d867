@@ -89,6 +89,74 @@ class QuarantineResponse(BaseModel):
     readings: list[QuarantineOut]
 
 
+# ---------------------------------------------------------------------------
+# read-only quarantine impact rehearsal
+# ---------------------------------------------------------------------------
+
+class TimelineKeyOut(BaseModel):
+    observed_at: str
+    source_id: str
+    seq: int
+
+
+class QuarantineAuditOut(BaseModel):
+    session_id: str
+    source_id: str
+    seq: int
+    observed_at: str
+    value: Optional[Any] = None
+    quarantined_watermark: str
+    reason: str = "behind_published_watermark"
+    insert_position: int = Field(
+        ...,
+        description=(
+            "Zero-based offset the reading would occupy in the published"
+            " timeline: the count of published readings whose keyset is"
+            " strictly smaller"
+        ),
+    )
+    stream_size: int = Field(
+        ..., description="Total published readings visible in the same snapshot"
+    )
+    prev_key: Optional[TimelineKeyOut] = Field(
+        None, description="Published neighbour immediately before the slot (null at the head)"
+    )
+    next_key: Optional[TimelineKeyOut] = Field(
+        None, description="Published neighbour immediately after the slot (null at the tail)"
+    )
+    gap_prev_seconds: Optional[float] = Field(
+        None, description="Event-time distance from prev_key (null when there is no predecessor)"
+    )
+    gap_next_seconds: Optional[float] = Field(
+        None, description="Event-time distance to next_key (null when there is no successor)"
+    )
+    earliest_affected_checkpoint: Optional[str] = Field(
+        None,
+        description=(
+            "Earliest checkpoint (by captured stream position) whose resume"
+            " would gain this reading; null when no checkpoint would"
+        ),
+    )
+
+
+class QuarantineAuditResponse(BaseModel):
+    session_id: str
+    source_id: Optional[str] = None
+    from_: Optional[str] = Field(
+        None,
+        validation_alias="from",
+        serialization_alias="from",
+    )
+    to: Optional[str] = None
+    limit: int
+    matched: int = Field(
+        ..., description="Quarantined rows matching the filters (pre-limit)"
+    )
+    returned: int = Field(..., description="Rows in this page")
+    has_more: bool = Field(..., description="True when more matched rows remain beyond limit")
+    readings: list[QuarantineAuditOut]
+
+
 class SealSourceIn(BaseModel):
     final_observed_at: str = Field(
         ...,
